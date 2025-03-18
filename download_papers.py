@@ -5,20 +5,24 @@ import time
 from bs4 import BeautifulSoup
 import re
 import argparse
+import json
 from urllib.parse import urljoin
 
 class PMCDownloader:
-    def __init__(self, output_dir="pmc_documents", delay=1):
+    def __init__(self, output_dir="pmc_documents", delay=1, history_file="download_history.json"):
         """
         Initialize the PMC downloader.
         
         Args:
             output_dir (str): Directory to save downloaded documents
             delay (float): Delay between requests in seconds
+            history_file (str): File to track downloaded documents
         """
         self.base_url = "https://pmc.ncbi.nlm.nih.gov"
         self.output_dir = output_dir
         self.delay = delay
+        self.history_file = history_file
+        self.downloaded_pmcids = self.load_history()
         
         # Create output directory if it doesn't exist
         if not os.path.exists(output_dir):
@@ -30,6 +34,72 @@ class PMCDownloader:
             "Accept": "text/html,application/xhtml+xml,application/xml",
             "Accept-Language": "en-US,en;q=0.9",
         }
+    
+    def load_history(self):
+        """
+        Load download history from file and rebuild from existing files if needed.
+        
+        Returns:
+            set: Set of PMC IDs that have been downloaded
+        """
+        pmcids = set()
+        
+        # First try to load from history file
+        if os.path.exists(self.history_file):
+            try:
+                with open(self.history_file, 'r') as f:
+                    history = json.load(f)
+                    pmcids = set(history.get("pmcids", []))
+                print(f"Loaded {len(pmcids)} PMC IDs from history file")
+            except Exception as e:
+                print(f"Error loading history file: {e}")
+        
+        # Then scan the output directory to rebuild history from existing files
+        if os.path.exists(self.output_dir):
+            print("Scanning output directory to rebuild history...")
+            file_count = 0
+            for filename in os.listdir(self.output_dir):
+                if filename.endswith('.txt'):
+                    # Extract PMC ID from filename (format: PMC123456_Title.txt)
+                    pmc_match = re.match(r'(PMC\d+)_', filename)
+                    if pmc_match:
+                        pmcids.add(pmc_match.group(1))
+                        file_count += 1
+                    else:
+                        # Try to extract PMC ID from file content if not in filename
+                        try:
+                            filepath = os.path.join(self.output_dir, filename)
+                            with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+                                content = f.read(1000)  # Read just the beginning
+                                pmc_match = re.search(r'PMC ID: (PMC\d+)', content)
+                                if pmc_match:
+                                    pmcids.add(pmc_match.group(1))
+                                    file_count += 1
+                        except Exception as e:
+                            print(f"Error reading file {filename}: {e}")
+            
+            print(f"Found {file_count} files in output directory")
+            print(f"Total unique PMC IDs after rebuilding: {len(pmcids)}")
+            
+            # Save the rebuilt history
+            try:
+                with open(self.history_file, 'w') as f:
+                    json.dump({"pmcids": list(pmcids)}, f)
+                print(f"Saved rebuilt history to {self.history_file}")
+            except Exception as e:
+                print(f"Error saving rebuilt history: {e}")
+        
+        return pmcids
+    
+    def save_history(self):
+        """
+        Save download history to file.
+        """
+        try:
+            with open(self.history_file, 'w') as f:
+                json.dump({"pmcids": list(self.downloaded_pmcids)}, f)
+        except Exception as e:
+            print(f"Error saving history file: {e}")
     
     def get_random_pmcid(self):
         """
@@ -71,38 +141,50 @@ class PMCDownloader:
                 print("No article links found in either search")
                 return None
             
-            # Pick a random article link
-            random_article = random.choice(article_links)
-            article_url = random_article.get('href')
-            
-            # If the URL is relative, make it absolute
-            if article_url and not article_url.startswith('http'):
-                if article_url.startswith('/'):
-                    article_url = urljoin("https://www.ncbi.nlm.nih.gov", article_url)
-                else:
-                    article_url = urljoin(search_url, article_url)
-            
-            # Extract PMC ID from the URL
-            pmcid_match = re.search(r'PMC(\d+)', article_url)
-            if pmcid_match:
-                return pmcid_match.group(0)
-            else:
-                # If we can't find a PMC ID in the URL, check if it's a PubMed ID and try to convert
-                pubmed_match = re.search(r'/(\d+)/?$', article_url)
-                if pubmed_match:
-                    pubmed_id = pubmed_match.group(1)
-                    # Try to find PMC ID in the article page
-                    article_response = requests.get(f"https://pubmed.ncbi.nlm.nih.gov/{pubmed_id}", headers=self.headers)
-                    if article_response.status_code == 200:
-                        article_soup = BeautifulSoup(article_response.text, 'html.parser')
-                        pmc_link = article_soup.select_one("a[href*='PMC']")
-                        if pmc_link:
-                            pmc_match = re.search(r'PMC(\d+)', pmc_link.get('href', ''))
-                            if pmc_match:
-                                return pmc_match.group(0)
+            # Try up to 10 random articles to find one not in history
+            for _ in range(10):
+                # Pick a random article link
+                random_article = random.choice(article_links)
+                article_url = random_article.get('href')
                 
-                print(f"Could not extract PMC ID from URL: {article_url}")
-                return None
+                # If the URL is relative, make it absolute
+                if article_url and not article_url.startswith('http'):
+                    if article_url.startswith('/'):
+                        article_url = urljoin("https://www.ncbi.nlm.nih.gov", article_url)
+                    else:
+                        article_url = urljoin(search_url, article_url)
+                
+                # Extract PMC ID from the URL
+                pmcid_match = re.search(r'PMC(\d+)', article_url)
+                if pmcid_match:
+                    pmcid = pmcid_match.group(0)
+                    if pmcid not in self.downloaded_pmcids:
+                        return pmcid
+                    else:
+                        print(f"Skipping already downloaded PMC ID: {pmcid}")
+                        continue
+                else:
+                    # If we can't find a PMC ID in the URL, check if it's a PubMed ID and try to convert
+                    pubmed_match = re.search(r'/(\d+)/?$', article_url)
+                    if pubmed_match:
+                        pubmed_id = pubmed_match.group(1)
+                        # Try to find PMC ID in the article page
+                        article_response = requests.get(f"https://pubmed.ncbi.nlm.nih.gov/{pubmed_id}", headers=self.headers)
+                        if article_response.status_code == 200:
+                            article_soup = BeautifulSoup(article_response.text, 'html.parser')
+                            pmc_link = article_soup.select_one("a[href*='PMC']")
+                            if pmc_link:
+                                pmc_match = re.search(r'PMC(\d+)', pmc_link.get('href', ''))
+                                if pmc_match:
+                                    pmcid = pmc_match.group(0)
+                                    if pmcid not in self.downloaded_pmcids:
+                                        return pmcid
+                                    else:
+                                        print(f"Skipping already downloaded PMC ID: {pmcid}")
+                                        continue
+            
+            print("Could not find a new PMC ID that hasn't been downloaded before")
+            return None
                 
         except Exception as e:
             print(f"Error in get_random_pmcid: {e}")
@@ -171,6 +253,10 @@ class PMCDownloader:
                 f.write(f"Abstract:\n{abstract}\n\n")
                 f.write(f"Content:\n{content}\n")
             
+            # Add to downloaded list and save history
+            self.downloaded_pmcids.add(pmcid)
+            self.save_history()
+            
             print(f"Successfully downloaded: {pmcid} - {title}")
             return True
             
@@ -187,7 +273,9 @@ class PMCDownloader:
         """
         success_count = 0
         attempt_count = 0
-        max_attempts = count * 3  # Allow for some failures
+        max_attempts = count * 5  # Allow for more failures due to duplicates
+        
+        print(f"Starting download of {count} documents. Already downloaded: {len(self.downloaded_pmcids)} documents.")
         
         while success_count < count and attempt_count < max_attempts:
             pmcid = self.get_random_pmcid()
@@ -203,6 +291,7 @@ class PMCDownloader:
             attempt_count += 1
         
         print(f"Downloaded {success_count} documents (requested {count})")
+        print(f"Total unique documents in history: {len(self.downloaded_pmcids)}")
 
 
 if __name__ == "__main__":
@@ -210,7 +299,8 @@ if __name__ == "__main__":
     parser.add_argument("-n", "--num", type=int, default=10, help="Number of documents to download")
     parser.add_argument("-o", "--output", type=str, default="pmc_documents", help="Output directory")
     parser.add_argument("-d", "--delay", type=float, default=1.0, help="Delay between requests in seconds")
+    parser.add_argument("-f", "--history", type=str, default="download_history.json", help="History file to track downloads")
     args = parser.parse_args()
     
-    downloader = PMCDownloader(output_dir=args.output, delay=args.delay)
+    downloader = PMCDownloader(output_dir=args.output, delay=args.delay, history_file=args.history)
     downloader.download_random_documents(count=args.num)

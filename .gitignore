@@ -1,2 +1,9 @@
 venv/
 pmc_data/
+.DS_Store
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pyw
+*.pyz
